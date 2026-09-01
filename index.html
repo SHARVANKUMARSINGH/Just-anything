@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Expo AI Agent Builder</title>
+  
+  <script src="https://cdn.jsdelivr.net/npm/coi-serviceworker/coi-serviceworker.min.js"></script>
+  
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <script>
+    tailwind.config = { darkMode: 'class' }
+  </script>
+</head>
+<body class="bg-gray-900 text-gray-100 h-screen flex flex-col font-sans">
+  
+  <header class="bg-gray-800 p-4 border-b border-gray-700 flex flex-wrap gap-4 items-center justify-between">
+    <h1 class="text-xl font-bold text-blue-400">Expo AI Agent</h1>
+    
+    <div class="flex gap-4 flex-1 max-w-3xl">
+      <input 
+        type="password" 
+        id="apiKey" 
+        placeholder="Paste OpenRouter API Key" 
+        class="flex-1 bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+      />
+      <button 
+        id="loadModelsBtn" 
+        class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded font-medium text-sm transition-colors">
+        Connect
+      </button>
+      <select 
+        id="modelSelect" 
+        class="flex-1 bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none disabled:opacity-50" 
+        disabled>
+        <option>Select a Model...</option>
+      </select>
+    </div>
+  </header>
+
+  <main class="flex-1 flex overflow-hidden">
+    <div class="w-1/3 bg-gray-800 border-r border-gray-700 flex flex-col">
+      <div id="chatLog" class="flex-1 overflow-y-auto p-4 space-y-4 text-sm">
+        <div class="text-gray-400">Agent ready. Enter your OpenRouter key to begin.</div>
+      </div>
+      <div class="p-4 bg-gray-900 border-t border-gray-700">
+        <input 
+          type="text" 
+          id="userInput" 
+          placeholder="Ask for EXPO_TOKEN or give a command..." 
+          class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+        />
+      </div>
+    </div>
+
+    <div class="w-2/3 bg-black p-2 flex flex-col relative">
+      <div class="absolute top-4 right-4 text-xs text-gray-500 z-10" id="terminalStatus">Booting WebContainer...</div>
+      <div id="terminal" class="flex-1 w-full h-full"></div>
+    </div>
+  </main>
+
+  <script type="module">
+    import { WebContainer } from 'https://esm.sh/@webcontainer/api@1.3.0';
+    import { Terminal } from 'https://esm.sh/xterm@5.3.0';
+    import { FitAddon } from 'https://esm.sh/xterm-addon-fit@0.8.0';
+
+    const apiKeyInput = document.getElementById('apiKey');
+    const loadModelsBtn = document.getElementById('loadModelsBtn');
+    const modelSelect = document.getElementById('modelSelect');
+    const chatLog = document.getElementById('chatLog');
+    const userInput = document.getElementById('userInput');
+    const terminalStatus = document.getElementById('terminalStatus');
+    const terminalEl = document.getElementById('terminal');
+
+    let webcontainerInstance;
+    let term;
+    let chatHistory = [];
+
+    const SYSTEM_PROMPT = `You are an AI Agent operating a Linux WebContainer. Your job is to create a React Native Expo app.
+Rules:
+1. When you need to run a command, output it in a \`\`\`bash codeblock.
+2. The user wants to build a simple Expo app. Start with 'npx create-expo-app@latest my-app'.
+3. Ask the user for their EXPO_TOKEN to log in to EAS.
+4. If an EAS build or login command fails (e.g., multiple accounts, token error), read the terminal output and output new \`\`\`bash commands (like 'eas logout' or setting the EXPO_TOKEN variable) to automatically fix the error.`;
+
+    function initTerminal() {
+      term = new Terminal({ theme: { background: '#000000' }, convertEol: true });
+      const fitAddon = new FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(terminalEl);
+      fitAddon.fit();
+      return term;
+    }
+
+    function addChat(message, isAgent = false) {
+      const div = document.createElement('div');
+      div.className = `p-3 rounded-lg ${isAgent ? 'bg-blue-900/30 text-blue-100' : 'bg-gray-700 text-gray-100'}`;
+      div.innerText = message;
+      chatLog.appendChild(div);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    loadModelsBtn.addEventListener('click', async () => {
+      const key = apiKeyInput.value.trim();
+      if (!key) return alert("Please enter an OpenRouter API key.");
+      
+      loadModelsBtn.innerText = "Loading...";
+      try {
+        const res = await fetch("https://openrouter.ai/api/v1/models");
+        const data = await res.json();
+        
+        const models = data.data.sort((a, b) => a.pricing.prompt - b.pricing.prompt);
+        
+        modelSelect.innerHTML = '';
+        models.forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = m.id;
+          const isFree = m.pricing.prompt === "0" ? "[FREE] " : "";
+          opt.innerText = `${isFree}${m.name} (${m.id})`;
+          modelSelect.appendChild(opt);
+        });
+        
+        modelSelect.disabled = false;
+        loadModelsBtn.innerText = "Connected";
+        addChat("Connected to OpenRouter. Booting WebContainer...", true);
+        
+        await bootWebContainer();
+      } catch (err) {
+        addChat("Error fetching models: " + err.message, true);
+        loadModelsBtn.innerText = "Connect";
+      }
+    });
+
+    async function bootWebContainer() {
+      initTerminal();
+      try {
+        webcontainerInstance = await WebContainer.boot();
+        terminalStatus.innerText = "WebContainer Ready";
+        
+        const shellProcess = await webcontainerInstance.spawn('jsh');
+        shellProcess.output.pipeTo(new WritableStream({
+          write(data) {
+            term.write(data);
+          }
+        }));
+        
+        addChat("System ready. You can now tell the AI to start building the Expo app.", true);
+      } catch (err) {
+        terminalStatus.innerText = "Boot Failed";
+        addChat("Failed to boot WebContainer: " + err.message, true);
+      }
+    }
+
+    async function askAgent(prompt) {
+      const key = apiKeyInput.value.trim();
+      const model = modelSelect.value;
+      
+      chatHistory.push({ role: "user", content: prompt });
+      addChat(prompt, false);
+
+      try {
+        const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${key}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: model,
+            messages: [{ role: "system", content: SYSTEM_PROMPT }, ...chatHistory]
+          })
+        });
+
+        const data = await res.json();
+        const reply = data.choices[0].message.content;
+        chatHistory.push({ role: "assistant", content: reply });
+        addChat(reply, true);
+
+        const commandRegex = /```bash\n([\s\S]*?)```/g;
+        let match;
+        while ((match = commandRegex.exec(reply)) !== null) {
+          const command = match[1].trim();
+          await executeAndMonitorCommand(command);
+        }
+      } catch (err) {
+        addChat("Agent Error: " + err.message, true);
+      }
+    }
+
+    async function executeAndMonitorCommand(command) {
+      addChat(`Executing: ${command}`, true);
+      term.write(`\r\n$ ${command}\r\n`);
+      
+      const process = await webcontainerInstance.spawn('jsh', ['-c', command]);
+      let outputBuffer = "";
+
+      process.output.pipeTo(new WritableStream({
+        write(data) {
+          term.write(data);
+          outputBuffer += data;
+        }
+      }));
+
+      const exitCode = await process.exit;
+      
+      if (exitCode !== 0 || outputBuffer.toLowerCase().includes("error")) {
+        addChat(`Command failed. Asking agent to fix it automatically...`, true);
+        await askAgent(`The previous command failed with this error. Please output the bash command to fix it:\n\n${outputBuffer}`);
+      } else {
+        addChat(`Command completed successfully.`, true);
+      }
+    }
+
+    userInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter' && userInput.value.trim()) {
+        askAgent(userInput.value.trim());
+        userInput.value = '';
+      }
+    });
+  </script>
+</body>
+</html>
+
